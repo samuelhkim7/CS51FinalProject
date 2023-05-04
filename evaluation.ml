@@ -70,19 +70,28 @@ module Env : ENV =
     let empty () : env = []
 
     let close (exp : expr) (env : env) : value =
-      failwith "close not implemented"
+      Closure (exp, env)
 
     let lookup (env : env) (varname : varid) : value =
-      failwith "lookup not implemented"
+      try 
+        let ref = List.assoc_opt varname env in
+        !(Option.get ref)
+      with _ -> raise (EvalError ("(" ^ varname ^ ") not found in environment"))
 
     let extend (env : env) (varname : varid) (loc : value ref) : env =
-      failwith "extend not implemented"
+      (varname, loc) :: (List.remove_assoc varname env)
 
-    let value_to_string ?(printenvp : bool = true) (v : value) : string =
-      failwith "value_to_string not implemented"
+    let rec value_to_string ?(printenvp : bool = true) (v : value) : string =
+      match v with 
+      | Val n -> exp_to_concrete_string n
+      | Closure (n, env) -> if printenvp then (env_to_string env) ^ ":" ^ (exp_to_concrete_string n)
+                            else exp_to_concrete_string n
 
-    let env_to_string (env : env) : string =
-      failwith "env_to_string not implemented"
+    and env_to_string (env : env) : string =
+      match env with 
+      | [] -> ""
+      | (n, n_val) :: tl -> Printf.sprintf "(%s, %s); %s" 
+                            n (value_to_string !n_val) (env_to_string tl)
   end
 ;;
 
@@ -115,22 +124,117 @@ let eval_t (exp : expr) (_env : Env.env) : Env.value =
   (* coerce the expr, unchanged, into a value *)
   Env.Val exp ;;
 
+let val_to_expr (v : Env.value) : expr =
+  match v with
+  | Val n -> n
+  | _ -> raise (EvalError "val_to_expr: function applied to closure")
+;;
+
+let val_to_int (v: Env.value) : int =
+  match val_to_expr v with
+  | Num n -> n 
+  | _ -> raise (EvalError "val_to_int: function applied to non-integer")
+;;
+
+let unop_eval (op : unop) (v : Env.value) : Env.value =
+  let n = val_to_int v in
+  match op with 
+  | Negate -> Val (Num (~-n))
+;;
+
+let binop_eval (op : binop) (v1: Env.value) (v2: Env.value) : Env.value =
+  let x, y = val_to_int v1, val_to_int v2 in
+  match op with 
+  | Plus -> Env.Val (Num (x + y))
+  | Minus -> Env.Val (Num (x - y))
+  | Times -> Env.Val (Num (x * y))
+  | Equals -> Env.Val (Bool (x = y))
+  | LessThan -> Env.Val (Bool (x < y))
+;;
+
 (* The SUBSTITUTION MODEL evaluator -- to be completed *)
    
-let eval_s (_exp : expr) (_env : Env.env) : Env.value =
-  failwith "eval_s not implemented" ;;
-     
+let rec eval_s (exp : expr) (_env : Env.env) : Env.value =
+  match exp with 
+  | Var n -> raise (EvalError ("unbound value" ^ n)) 
+  | Num _
+  | Bool _ -> Env.Val exp
+  | Unop (op, expr1) -> unop_eval op (eval_s expr1 _env)
+  | Binop (op, expr1, expr2) -> binop_eval op (eval_s expr1 _env) 
+                                (eval_s expr2 _env)
+  | Conditional (condition, expr1, expr2) -> if (eval_s condition _env) = 
+                                             Env.Val (Bool true)
+                                               then (eval_s expr1 _env)
+                                             else (eval_s expr2 _env)
+  | Fun (_n, _expr1) -> Env.Val exp
+  | Let (n, expr1, expr2) -> eval_s (subst n (val_to_expr (eval_s expr1 _env))
+                             expr2) _env
+  | Letrec (n, expr1, expr2) -> let v = val_to_expr (eval_s expr1 _env) in
+                                let repl = subst n (Letrec (n, v, Var(n))) v in
+                                eval_s (subst n repl expr2) _env
+  | Raise
+  | Unassigned -> raise EvalException
+  | App (expr1, expr2) -> match eval_s expr1 _env with
+                          | Env.Val (Fun (n, body)) -> eval_s (subst n (val_to_expr (eval_s expr2 _env)) body) _env
+                          | _ -> raise (EvalError "eval_s unbound function")
+;;
+
+let rec eval_helper (is_dynamic: bool) 
+                    (exp: expr) (env : Env.env) : Env.value =
+  match exp with
+  | Var n -> Env.lookup env n
+  | Num _
+  | Bool _ -> Env.Val exp
+  | Unop (op, expr1) -> unop_eval op (eval_helper is_dynamic expr1 env)
+  | Binop (op, expr1, expr2) -> 
+                              binop_eval op (eval_helper is_dynamic expr1 env) 
+                                            (eval_helper is_dynamic expr2 env)
+  | Conditional (n, expr1, expr2) -> if (eval_helper is_dynamic n env)
+                                     = Env.Val (Bool true)
+                                     then (eval_helper is_dynamic expr1 env)
+                                     else (eval_helper is_dynamic expr2 env)
+  (* For dynamic, just return the fun _exp unchanged, else package together _exp and _env in closure*)
+  | Fun (_,_) -> if is_dynamic then Env.Val exp else Env.close exp env
+  (* First evaluate definition (expr1) within the current environment. Then extend environment with n set to eval_def *)
+  | Let (n, expr1, expr2) -> let eval_def = 
+                             ref (eval_helper is_dynamic expr1 env) in
+                             eval_helper is_dynamic expr2 
+                             (Env.extend env n eval_def)
+  | Letrec (n, expr1, expr2) -> let new_loc = ref(Env.Val (Unassigned)) in
+                                let new_env = Env.extend env n new_loc in
+                                  new_loc := (eval_helper is_dynamic expr1 new_env);
+                                eval_helper is_dynamic expr2 new_env
+  | Raise
+  | Unassigned -> raise EvalException
+  | App (expr1, expr2) -> let v1 = eval_helper is_dynamic expr1 env in
+                          let v2 = ref (eval_helper is_dynamic expr2 env) in
+                          if is_dynamic then
+                            match val_to_expr v1 with
+                            | Fun (def, bod) -> 
+                              (* extending the environment with def set to evaluated expr2, then call helper function on bod and resulting new_env *)
+                              let new_env = Env.extend env def v2 in 
+                                eval_helper is_dynamic bod new_env
+                            | _ -> raise (EvalError "eval_d unbound function")
+                          else
+                            match v1 with
+                            | Closure (Fun (def, bod), lex_env) ->
+                              (* same idea but extend environment with def set to evaluated expr2 within the lexical environment then call helper function on bod and resulting new_lex environment*) 
+                              let new_lex = Env.extend lex_env def v2 in
+                                eval_helper is_dynamic bod new_lex
+                            | _ -> raise (EvalError "eval_l unbound function")
+;;                            
+
 (* The DYNAMICALLY-SCOPED ENVIRONMENT MODEL evaluator -- to be
    completed *)
    
 let eval_d (_exp : expr) (_env : Env.env) : Env.value =
-  failwith "eval_d not implemented" ;;
+  eval_helper true _exp _env ;;
        
 (* The LEXICALLY-SCOPED ENVIRONMENT MODEL evaluator -- optionally
    completed as (part of) your extension *)
    
 let eval_l (_exp : expr) (_env : Env.env) : Env.value =
-  failwith "eval_l not implemented" ;;
+  eval_helper false _exp _env ;;
 
 (* The EXTENDED evaluator -- if you want, you can provide your
    extension as a separate evaluator, or if it is type- and
@@ -148,4 +252,6 @@ let eval_e _ =
    above, not the `evaluate` function, so it doesn't matter how it's
    set when you submit your solution.) *)
    
-let evaluate = eval_t ;;
+let evaluate_s = eval_s ;;
+let evaluate_d = eval_d;;
+let evaluate_l = eval_l;;
